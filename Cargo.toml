@@ -1,0 +1,27 @@
+[package]
+name = "banqi-engine"
+version = "0.1.0"
+edition = "2024"
+description = "Banqi 策略与推理引擎层：基础策略、MCTS+DL、TorchScript/ONNX 推理、NNUE 量化网络"
+
+[dependencies]
+banqi-core = { path = "../banqi-core" }
+rand = "0.8"
+anyhow = "1.0"
+
+# PyTorch（TorchScript 推理，可选）
+tch = { version = "0.22", optional = true }
+
+# ONNX Runtime（可选；download-binaries 构建时下载预编译二进制）
+ort = { version = "2.0.0-rc.13", features = ["download-binaries"], optional = true }
+
+[features]
+default = []
+torch = ["tch"]
+onnx = ["dep:ort"]
+onnx-cuda = ["onnx", "ort/cuda"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
