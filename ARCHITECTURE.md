@@ -6,7 +6,7 @@
 
 Banqi 的**策略与推理引擎层** crate：基础策略、MCTS+深度学习策略、TorchScript / ONNX 推理后端、NNUE 量化网络。独立编译、独立发布，向下依赖领域核心 `banqi-core`（`core::mcts::Evaluator` 与 `core::expectimax::nnue::{NnueEvaluate, NnueAccumulator}` 的实现方）。
 
-上游消费方：`banqi-gui`（Tauri 桌面端）、未来的自对弈数据采集 crate、主仓库 `banqi_4x8`（切换中）。
+上游消费方：`banqi-gui`（Tauri 桌面端）、`banqi-collector`（分布式训练数据采集 crate，2026-09-11 自 rust_4x8 拆出）、主仓库 `banqi_4x8`（切换中）。
 
 ## 2. 模块
 
