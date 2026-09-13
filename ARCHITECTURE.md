@@ -36,3 +36,5 @@ banqi-core（领域核心）
 ## 变更记录
 
 - 2026-09-11：自 rust_4x8 拆分创立（engine/inference 迁入，NNUE 自 banqi-core 迁入并 trait 化），依赖 banqi-core path。
+- 2026-09-13：`inference/torchscript.rs` 的 `LocalEvaluator` 特征维度改为从首个环境的运行时观测推导（与 `TchEvaluator` / `OnnxEvaluator` 一致），移除对 `GameEnv` 关联常量的依赖——后者已随 banqi-core 2026-09-13 变更删除，且对 4x4 / 4x2 变体不成立。
+- 2026-09-13：`TchEvaluator` / `OnnxEvaluator` / `LocalEvaluator` 的动作空间宽度改为 `envs[0].action_space_size()`（随变体 352 / 112 / 40），替代 `G::action_space_size()`；模型输出与动作空间一致时不再补 `-inf`，不一致时保留原有补齐逻辑。

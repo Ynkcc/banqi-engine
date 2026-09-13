@@ -1,23 +1,23 @@
-use banqi_core::core::env::{DarkChessEnv, REVEAL_ACTIONS_COUNT};
+use banqi_core::core::env::DarkChessEnv;
 use rand::seq::SliceRandom;
 
 use super::Policy;
 
 /// 优先翻棋策略：
-/// - 若存在“翻棋”类有效动作（索引 < REVEAL_ACTIONS_COUNT），随机选其一
+/// - 若存在“翻棋”类有效动作（索引 < config.reveal_actions_count），随机选其一
 /// - 否则在剩余所有有效动作中随机选择
 pub struct RevealFirstPolicy;
 
 impl Policy for RevealFirstPolicy {
     fn choose_action(env: &DarkChessEnv) -> Option<usize> {
-        let mut masks = vec![0; banqi_core::core::env::ACTION_SPACE_SIZE];
+        let mut masks = vec![0; env.config.action_space_size];
         env.action_masks_into(&mut masks);
         let mut reveal_actions: Vec<usize> = Vec::new();
         let mut fallback_actions: Vec<usize> = Vec::new();
 
         for (idx, &m) in masks.iter().enumerate() {
             if m == 1 {
-                if idx < REVEAL_ACTIONS_COUNT {
+                if idx < env.config.reveal_actions_count {
                     reveal_actions.push(idx);
                 } else {
                     fallback_actions.push(idx);

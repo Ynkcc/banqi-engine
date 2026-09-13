@@ -222,7 +222,7 @@ impl<G: GameEnv> Evaluator<G> for OnnxEvaluator<G> {
         let board_cols = ref_obs.board.shape()[2];
         let scalar_count = ref_obs.scalars.len();
         let batch_size = envs.len();
-        let action_space = G::action_space_size();
+        let action_space = envs[0].action_space_size();
 
         let mut board_data = Vec::with_capacity(batch_size * board_channels * board_rows * board_cols);
         let mut scalars_data = Vec::with_capacity(batch_size * scalar_count);

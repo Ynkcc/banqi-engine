@@ -75,8 +75,8 @@ impl<G: GameEnv> Evaluator<G> for TchEvaluator<G> {
             };
         }
 
-        // 动作空间由环境类型决定（4x8/4x4/4x2 各自的 GameEnv 关联常量）。
-        let action_space = G::action_space_size();
+        // 动作空间由环境运行时 config 决定（4x8/4x4/4x2 各不相同）。
+        let action_space = envs[0].action_space_size();
 
         let _guard = self.model.gate.lock().unwrap();
         tch::no_grad(|| {

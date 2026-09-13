@@ -8,7 +8,7 @@ pub struct RandomPolicy;
 
 impl Policy for RandomPolicy {
     fn choose_action(env: &DarkChessEnv) -> Option<usize> {
-        let mut masks = vec![0; banqi_core::core::env::ACTION_SPACE_SIZE];
+        let mut masks = vec![0; env.config.action_space_size];
         env.action_masks_into(&mut masks);
         let valid_actions: Vec<usize> = masks
             .iter()

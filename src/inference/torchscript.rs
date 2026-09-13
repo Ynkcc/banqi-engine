@@ -58,10 +58,17 @@ impl<G: GameEnv> Evaluator<G> for LocalEvaluator<G> {
 
         tch::no_grad(|| {
             let batch_size = envs.len();
+
+            // 维度从首个环境的运行时观测推导（由 config 驱动，适配 4x8 / 4x4 / 4x2）。
+            let ref_obs = envs[0].get_resnet_state();
+            let board_channels = ref_obs.board.shape()[0];
+            let board_rows = ref_obs.board.shape()[1];
+            let board_cols = ref_obs.board.shape()[2];
+            let scalar_count = ref_obs.scalars.len();
+
             let mut board_data: Vec<f32> =
-                Vec::with_capacity(batch_size * G::RESNET_BOARD_CHANNELS * G::BOARD_ROWS * G::BOARD_COLS);
-            let mut scalar_data: Vec<f32> =
-                Vec::with_capacity(batch_size * G::RESNET_SCALAR_FEATURE_COUNT);
+                Vec::with_capacity(batch_size * board_channels * board_rows * board_cols);
+            let mut scalar_data: Vec<f32> = Vec::with_capacity(batch_size * scalar_count);
 
             // 复用临时缓冲，避免每个 env 新建堆分配（与 PyEvaluator 一致）。
             let mut board_buf = Vec::new();
@@ -75,15 +82,15 @@ impl<G: GameEnv> Evaluator<G> for LocalEvaluator<G> {
             let board_tensor = Tensor::from_slice(&board_data)
                 .view([
                     batch_size as i64,
-                    G::RESNET_BOARD_CHANNELS as i64,
-                    G::BOARD_ROWS as i64,
-                    G::BOARD_COLS as i64,
+                    board_channels as i64,
+                    board_rows as i64,
+                    board_cols as i64,
                 ])
                 .to_device(self.device)
                 .to_kind(Kind::Float);
 
             let scalar_tensor = Tensor::from_slice(&scalar_data)
-                .view([batch_size as i64, G::RESNET_SCALAR_FEATURE_COUNT as i64])
+                .view([batch_size as i64, scalar_count as i64])
                 .to_device(self.device)
                 .to_kind(Kind::Float);
 
@@ -125,7 +132,7 @@ impl<G: GameEnv> Evaluator<G> for LocalEvaluator<G> {
                 _ => panic!("Expected tuple of 2 or 3 tensors from model"),
             };
 
-            let action_space = G::action_space_size();
+            let action_space = envs[0].action_space_size();
             let mut logits_flat = vec![0.0f32; batch_size * action_space];
             let logits_len = logits_flat.len();
             policy_logits
