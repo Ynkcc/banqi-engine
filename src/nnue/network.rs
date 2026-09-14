@@ -241,7 +241,7 @@ impl NnueBoard {
         evaluator: &NnueEvaluator,
     ) -> Result<(f32, bool, bool, Option<i32>), String> {
         let before_env = self.env;
-        let res = self.env.step(action, reveal_piece)?;
+        let res = self.env.step(action, reveal_piece).map_err(|e| e.to_string())?;
         let (diff_red, diff_black) = super::feature::compute_step_diff(&before_env, &self.env, action);
         self.accumulators.apply_diffs(&diff_red, &diff_black, evaluator);
         Ok(res)
