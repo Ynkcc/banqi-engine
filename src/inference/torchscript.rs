@@ -14,9 +14,11 @@
 
 use anyhow::Result;
 use banqi_core::core::env::GameEnv;
-use banqi_core::core::mcts::{Evaluator, EvaluatorOutput};
-use tch::{CModule, Device, Kind, Tensor};
+use banqi_core::core::mcts::{Evaluator, EvaluatorError, EvaluatorOutput};
 use std::marker::PhantomData;
+use tch::{CModule, Device, Kind, Tensor};
+
+use super::batch::{batch_dims, empty_output, encode_batch, torch};
 
 // ============================================================================
 // 本地模型评估器
@@ -47,123 +49,41 @@ impl<G: GameEnv> LocalEvaluator<G> {
 }
 
 impl<G: GameEnv> Evaluator<G> for LocalEvaluator<G> {
-    fn evaluate(&self, envs: &[G]) -> EvaluatorOutput {
+    fn evaluate(&self, envs: &[G]) -> Result<EvaluatorOutput, EvaluatorError> {
         if envs.is_empty() {
-            return EvaluatorOutput {
-                logits: Vec::new(),
-                values: Vec::new(),
-                health: None,
-            };
+            return Ok(empty_output());
         }
 
+        let dims = batch_dims(envs);
+        let action_space = envs[0].action_space_size();
+        let (board_data, scalar_data) = encode_batch(envs, &dims);
+
         tch::no_grad(|| {
-            let batch_size = envs.len();
-
-            // 维度从首个环境的运行时观测推导（由 config 驱动，适配 4x8 / 4x4 / 4x2）。
-            let ref_obs = envs[0].get_resnet_state();
-            let board_channels = ref_obs.board.shape()[0];
-            let board_rows = ref_obs.board.shape()[1];
-            let board_cols = ref_obs.board.shape()[2];
-            let scalar_count = ref_obs.scalars.len();
-
-            let mut board_data: Vec<f32> =
-                Vec::with_capacity(batch_size * board_channels * board_rows * board_cols);
-            let mut scalar_data: Vec<f32> = Vec::with_capacity(batch_size * scalar_count);
-
-            // 复用临时缓冲，避免每个 env 新建堆分配（与 PyEvaluator 一致）。
-            let mut board_buf = Vec::new();
-            let mut scalar_buf = Vec::new();
-            for env in envs {
-                env.encode_resnet_features_flat_into(&mut board_buf, &mut scalar_buf);
-                board_data.extend_from_slice(&board_buf);
-                scalar_data.extend_from_slice(&scalar_buf);
-            }
-
             let board_tensor = Tensor::from_slice(&board_data)
                 .view([
-                    batch_size as i64,
-                    board_channels as i64,
-                    board_rows as i64,
-                    board_cols as i64,
+                    dims.batch as i64,
+                    dims.channels as i64,
+                    dims.rows as i64,
+                    dims.cols as i64,
                 ])
                 .to_device(self.device)
                 .to_kind(Kind::Float);
 
             let scalar_tensor = Tensor::from_slice(&scalar_data)
-                .view([batch_size as i64, scalar_count as i64])
+                .view([dims.batch as i64, dims.scalars as i64])
                 .to_device(self.device)
                 .to_kind(Kind::Float);
 
-            let board_ivalue = tch::IValue::Tensor(board_tensor);
-            let scalar_ivalue = tch::IValue::Tensor(scalar_tensor);
             let outputs = self
                 .model
-                .forward_is(&[board_ivalue, scalar_ivalue])
-                .expect("TorchScript forward failed");
+                .forward_is(&[
+                    tch::IValue::Tensor(board_tensor),
+                    tch::IValue::Tensor(scalar_tensor),
+                ])
+                .map_err(|e| EvaluatorError::new(format!("TorchScript 前向失败: {e}")))?;
 
-            // 兼容 2 输出（旧模型）与 3 输出（带血量差异头）。
-            let (policy_logits, value, health_t) = match outputs {
-                tch::IValue::Tuple(mut tensors) if tensors.len() == 2 => {
-                    let value = match tensors.pop().unwrap() {
-                        tch::IValue::Tensor(t) => t,
-                        _ => panic!("Expected Tensor for value"),
-                    };
-                    let policy_logits = match tensors.pop().unwrap() {
-                        tch::IValue::Tensor(t) => t,
-                        _ => panic!("Expected Tensor for policy"),
-                    };
-                    (policy_logits, value, None)
-                }
-                tch::IValue::Tuple(mut tensors) if tensors.len() == 3 => {
-                    let health = match tensors.pop().unwrap() {
-                        tch::IValue::Tensor(t) => t,
-                        _ => panic!("Expected Tensor for health"),
-                    };
-                    let value = match tensors.pop().unwrap() {
-                        tch::IValue::Tensor(t) => t,
-                        _ => panic!("Expected Tensor for value"),
-                    };
-                    let policy_logits = match tensors.pop().unwrap() {
-                        tch::IValue::Tensor(t) => t,
-                        _ => panic!("Expected Tensor for policy"),
-                    };
-                    (policy_logits, value, Some(health))
-                }
-                _ => panic!("Expected tuple of 2 or 3 tensors from model"),
-            };
-
-            let action_space = envs[0].action_space_size();
-            let mut logits_flat = vec![0.0f32; batch_size * action_space];
-            let logits_len = logits_flat.len();
-            policy_logits
-                .to_device(Device::Cpu)
-                .copy_data(&mut logits_flat, logits_len);
-            let logits_vec: Vec<Vec<f32>> = logits_flat
-                .chunks(action_space)
-                .map(|chunk| chunk.to_vec())
-                .collect();
-
-            let mut values = vec![0.0f32; batch_size];
-            let values_len = values.len();
-            value
-                .to_device(Device::Cpu)
-                .view([batch_size as i64])
-                .copy_data(&mut values, values_len);
-
-            // 血量差异头：[B, K] 分桶 logits；旧模型为 None。
-            let health = health_t.map(|h| {
-                let k = h.size()[1] as usize;
-                let mut health_flat = vec![0.0f32; batch_size * k];
-                let n = health_flat.len();
-                h.to_device(Device::Cpu).copy_data(&mut health_flat, n);
-                health_flat.chunks(k).map(|c| c.to_vec()).collect()
-            });
-
-            EvaluatorOutput {
-                logits: logits_vec,
-                values,
-                health,
-            }
+            let (policy_logits, value, health_t) = torch::unwrap_outputs(outputs)?;
+            torch::assemble_output(policy_logits, value, health_t, &dims, action_space)
         })
     }
 }

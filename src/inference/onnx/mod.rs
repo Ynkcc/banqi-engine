@@ -19,7 +19,11 @@ use ort::session::Session;
 use ort::value::Tensor;
 
 use banqi_core::core::env::GameEnv;
-use banqi_core::core::mcts::{Evaluator, EvaluatorOutput, GumbelConfig, GumbelMCTS};
+use banqi_core::core::mcts::{
+    Evaluator, EvaluatorError, EvaluatorOutput, GumbelConfig, GumbelMCTS,
+};
+
+use super::batch::{batch_dims, empty_output, encode_batch, output_from_row_logits};
 
 // ============================================================================
 // ONNX 模型封装
@@ -206,77 +210,32 @@ impl<G: GameEnv> OnnxEvaluator<G> {
 }
 
 impl<G: GameEnv> Evaluator<G> for OnnxEvaluator<G> {
-    fn evaluate(&self, envs: &[G]) -> EvaluatorOutput {
+    fn evaluate(&self, envs: &[G]) -> Result<EvaluatorOutput, EvaluatorError> {
         if envs.is_empty() {
-            return EvaluatorOutput {
-                logits: Vec::new(),
-                values: Vec::new(),
-                health: None,
-            };
+            return Ok(empty_output());
         }
 
-        // 维度从首个环境运行时观测推导（兼容 4x8 / 4x4 / 4x2 三种棋盘）。
-        let ref_obs = envs[0].get_resnet_state();
-        let board_channels = ref_obs.board.shape()[0];
-        let board_rows = ref_obs.board.shape()[1];
-        let board_cols = ref_obs.board.shape()[2];
-        let scalar_count = ref_obs.scalars.len();
-        let batch_size = envs.len();
+        let dims = batch_dims(envs);
         let action_space = envs[0].action_space_size();
+        let (board_data, scalars_data) = encode_batch(envs, &dims);
 
-        let mut board_data = Vec::with_capacity(batch_size * board_channels * board_rows * board_cols);
-        let mut scalars_data = Vec::with_capacity(batch_size * scalar_count);
-        let mut board_buf = Vec::new();
-        let mut scalar_buf = Vec::new();
-        for env in envs {
-            env.encode_resnet_features_flat_into(&mut board_buf, &mut scalar_buf);
-            board_data.extend_from_slice(&board_buf);
-            scalars_data.extend_from_slice(&scalar_buf);
-        }
+        let (raw_logits, values, health) = self
+            .model
+            .run(
+                &board_data,
+                &scalars_data,
+                dims.batch,
+                dims.channels,
+                dims.rows,
+                dims.cols,
+                dims.scalars,
+            )
+            .map_err(EvaluatorError::from)?;
 
-        let (raw_logits, values, health) = match self.model.run(
-            &board_data,
-            &scalars_data,
-            batch_size,
-            board_channels,
-            board_rows,
-            board_cols,
-            scalar_count,
-        ) {
-            Ok(x) => x,
-            Err(e) => {
-                // Evaluator 接口无 Result；推理失败时退化为均匀 logits（受合法
-                // 动作掩码约束），记录日志避免静默。
-                eprintln!("[onnx] 推理失败: {e}");
-                return EvaluatorOutput {
-                    logits: vec![vec![0.0f32; action_space]; batch_size],
-                    values: vec![0.0f32; batch_size],
-                    health: None,
-                };
-            }
-        };
-
-        // 模型输出动作维度可能小于环境动作空间（如 4x4 模型 112 vs 192），
-        // 不足部分补 -inf（在合法动作掩码下无效，不影响搜索）。
-        let model_action = raw_logits.first().map_or(0, |r| r.len());
-        let copy_n = model_action.min(action_space);
-        let logits: Vec<Vec<f32>> = raw_logits
-            .into_iter()
-            .map(|row| {
-                let mut padded = vec![f32::NEG_INFINITY; action_space];
-                padded[..copy_n].copy_from_slice(&row[..copy_n]);
-                padded
-            })
-            .collect();
-
-        EvaluatorOutput {
-            logits,
-            values,
-            health,
-        }
+        output_from_row_logits(&raw_logits, dims.batch, action_space, values, health)
     }
 
-    fn evaluate_logits(&self, envs: &[G]) -> EvaluatorOutput {
+    fn evaluate_logits(&self, envs: &[G]) -> Result<EvaluatorOutput, EvaluatorError> {
         self.evaluate(envs)
     }
 }
@@ -305,17 +264,17 @@ impl<G: GameEnv> OnnxMctsPolicy<G> {
         self.num_simulations = sims.max(1);
     }
 
-    pub fn choose_action(&self, env: &G) -> Option<usize> {
+    pub fn choose_action(&self, env: &G) -> Result<Option<usize>, EvaluatorError> {
         onnx_choose_action_once(&self.model, env, self.num_simulations)
     }
 }
 
-/// 为给定环境选择最佳动作（每次创建新 MCTS）。
+/// 为给定环境选择最佳动作（每次创建新 MCTS）；评估失败返回 Err。
 pub fn onnx_choose_action_once<G: GameEnv>(
     model: &Arc<OnnxModel>,
     env: &G,
     num_simulations: usize,
-) -> Option<usize> {
+) -> Result<Option<usize>, EvaluatorError> {
     let evaluator = OnnxEvaluator::<G>::new(model.clone());
     let config = GumbelConfig {
         num_simulations,
@@ -325,5 +284,5 @@ pub fn onnx_choose_action_once<G: GameEnv>(
         ..Default::default()
     };
     let mut mcts = GumbelMCTS::new(env, &evaluator, config);
-    mcts.run().map(|result| result.action)
+    Ok(mcts.run()?.map(|result| result.action))
 }

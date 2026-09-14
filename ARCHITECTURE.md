@@ -13,7 +13,7 @@ Banqi 的**策略与推理引擎层** crate：基础策略、MCTS+深度学习�
 | 模块 | 内容 | feature |
 |---|---|---|
 | `engine/` | `policies/`（`Policy` trait、`RandomPolicy`、`RevealFirstPolicy`）、`mcts_dl.rs`（`ModelWrapper` / `TchEvaluator<G>` / `MctsDlPolicy<G>`，Gumbel MCTS 落子） | `mcts_dl` 需 `torch` |
-| `inference/` | `torchscript.rs`（`LocalEvaluator<G>`，Rust 侧批量推理，GIL-free）、`onnx/mod.rs`（`OnnxModel` / `OnnxEvaluator<G>` / `OnnxMctsPolicy<G>`，CUDA EP 可选） | 分别需 `torch` / `onnx` |
+| `inference/` | `batch.rs`（Evaluator 批量组装公共实现：维度推导 / 特征编码 / 输出对齐与 TorchScript 输出解包）、`torchscript.rs`（`LocalEvaluator<G>`，Rust 侧批量推理，GIL-free）、`onnx/mod.rs`（`OnnxModel` / `OnnxEvaluator<G>` / `OnnxMctsPolicy<G>`，CUDA EP 可选） | `batch.rs` 需 `torch` 或 `onnx`；后两者分别需 `torch` / `onnx` |
 | `nnue/` | `feature.rs`（`Accumulator` / `DualAccumulator` / `FeatureDiff` / `compute_step_diff`）、`network.rs`（`NnueEvaluator` 量化前向 + `NnueBoard` 增量评估包装）、`adapter.rs`（trait 桥接 + `NnueEngineExt::from_nnue_file`） | 无（始终可用） |
 
 ## 3. feature 矩阵
@@ -38,3 +38,4 @@ banqi-core（领域核心）
 - 2026-09-11：自 rust_4x8 拆分创立（engine/inference 迁入，NNUE 自 banqi-core 迁入并 trait 化），依赖 banqi-core path。
 - 2026-09-13：`inference/torchscript.rs` 的 `LocalEvaluator` 特征维度改为从首个环境的运行时观测推导（与 `TchEvaluator` / `OnnxEvaluator` 一致），移除对 `GameEnv` 关联常量的依赖——后者已随 banqi-core 2026-09-13 变更删除，且对 4x4 / 4x2 变体不成立。
 - 2026-09-13：`TchEvaluator` / `OnnxEvaluator` / `LocalEvaluator` 的动作空间宽度改为 `envs[0].action_space_size()`（随变体 352 / 112 / 40），替代 `G::action_space_size()`；模型输出与动作空间一致时不再补 `-inf`，不一致时保留原有补齐逻辑。
+- 2026-09-15：Evaluator 去重与错误化：①新增 `inference/batch.rs` 收敛三后端共用的「维度推导 / 特征编码 / 输出对齐 / TorchScript 输出解包」样板（原为 4 份拷贝）；②`LocalEvaluator` / `TchEvaluator` 改用 `encode_resnet_features_flat_into` 复用缓冲（原 `TchEvaluator` 每环境两次 `get_resnet_state` 分配）并统一按 min 截断 + 补 `-inf`（宽度不一致时打印一次提示）；③三个 `evaluate` 改为 `Result<_, EvaluatorError>`：删除 torch 侧的 `expect`/5 处 `panic!`，并**删除 ONNX 侧「推理失败退化为均匀 logits」的静默 fallback**（改为 `Err`，由调用方决定重试/终止）；④`MctsDlPolicy::choose_action` / `choose_action_once` / `OnnxMctsPolicy::choose_action` / `onnx_choose_action_once` 改为返回 `Result<Option<usize>, EvaluatorError>`；⑤`ModelWrapper.gate` 锁中毒改为恢复而非 panic。
