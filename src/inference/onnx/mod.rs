@@ -47,8 +47,9 @@ pub struct OnnxModel {
 impl OnnxModel {
     /// 加载 ONNX 模型（单会话）。需要并发推理时用 [`OnnxModel::with_sessions`]。
     ///
-    /// `device`: "cpu" 强制 CPU；"cuda" / "auto" 在启用 `onnx-cuda` feature 时
-    /// 尝试 CUDA EP（失败自动回退 CPU），否则直接使用 CPU。
+    /// `device`：`"cpu"` 强制 CPU；`"cuda"` 要求 GPU（EP 不可用即报错，不回退）；
+    /// `"auto"` 优先 GPU、不可用回退 CPU。后两者需启用 `onnx-cuda` feature，
+    /// 否则一律 CPU。
     pub fn new(model_path: &str, device: &str) -> Result<Self, String> {
         Self::with_sessions(model_path, device, 1)
     }
@@ -64,15 +65,10 @@ impl OnnxModel {
             .map(|v| v.get())
             .unwrap_or(1);
         let intra_threads = (cores / count).max(1);
-        let prefer_gpu = matches!(device, "cuda" | "auto");
 
         let mut pool = Vec::with_capacity(count);
         for _ in 0..count {
-            pool.push(Mutex::new(build_session(
-                model_path,
-                prefer_gpu,
-                intra_threads,
-            )?));
+            pool.push(Mutex::new(build_session(model_path, device, intra_threads)?));
         }
         Ok(Self {
             sessions: pool,
@@ -178,12 +174,28 @@ fn builder_with_intra_threads(intra_threads: usize) -> Result<ort::session::buil
         .map_err(|e| format!("设置 ONNX intra-op 线程数失败 ({intra_threads}): {e}"))
 }
 
+/// CUDA 策略：`Some(true)` = 必须用 GPU（EP 注册失败即报错，不静默退回 CPU）；
+/// `Some(false)` = 优先 GPU、不可用则回退；`None` = 不用 GPU。
 #[cfg(feature = "onnx-cuda")]
-fn build_cuda_session(model_path: &str, intra_threads: usize) -> Result<Session, String> {
-    use ort::execution_providers::CUDAExecutionProvider;
-    let provider = CUDAExecutionProvider::default()
-        .build()
-        .map_err(|e| format!("CUDA EP 构建失败: {e}"))?;
+fn cuda_policy(device: &str) -> Option<bool> {
+    match device {
+        "cuda" => Some(true),
+        "auto" => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "onnx-cuda")]
+fn build_cuda_session(
+    model_path: &str,
+    intra_threads: usize,
+    require_cuda: bool,
+) -> Result<Session, String> {
+    use ort::ep::CUDA;
+    let mut provider = CUDA::default().build();
+    if require_cuda {
+        provider = provider.error_on_failure();
+    }
     builder_with_intra_threads(intra_threads)?
         .with_execution_providers([provider])
         .map_err(|e| format!("挂载 CUDA EP 失败: {e}"))?
@@ -193,19 +205,22 @@ fn build_cuda_session(model_path: &str, intra_threads: usize) -> Result<Session,
 
 /// 只有确定不会并发使用（如调用方 `sessions = 1`）时才应让 intra-op 吃满核心数，
 /// 池化并发时按 `核数 / 会话数` 分配，避免多会话各自开满线程导致超额订阅。
-fn build_session(model_path: &str, prefer_gpu: bool, intra_threads: usize) -> Result<Session, String> {
+fn build_session(model_path: &str, device: &str, intra_threads: usize) -> Result<Session, String> {
     #[cfg(feature = "onnx-cuda")]
-    if prefer_gpu {
-        match build_cuda_session(model_path, intra_threads) {
+    if let Some(require_cuda) = cuda_policy(device) {
+        match build_cuda_session(model_path, intra_threads, require_cuda) {
             Ok(s) => {
                 println!("[onnx] 已使用 CUDA EP: {model_path}");
                 return Ok(s);
+            }
+            Err(e) if require_cuda => {
+                return Err(format!("device=cuda 要求 GPU 推理，但 CUDA EP 不可用: {e}"));
             }
             Err(e) => eprintln!("[onnx] CUDA EP 不可用，回退 CPU: {e}"),
         }
     }
     #[cfg(not(feature = "onnx-cuda"))]
-    let _ = prefer_gpu;
+    let _ = device;
     builder_with_intra_threads(intra_threads)?
         .commit_from_file(model_path)
         .map_err(|e| format!("加载 ONNX 模型失败 ({model_path}): {e}"))
