@@ -13,6 +13,7 @@
 // （由 Python 侧 banqi/checkpoint.py 的 export_onnx 导出时指定）。
 
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ort::session::Session;
@@ -31,30 +32,62 @@ use super::batch::{batch_dims, empty_output, encode_batch, output_from_row_logit
 
 /// 加载并持有 ONNX 模型的推理服务。
 ///
-/// - `Mutex<Session>`：onnxruntime 的 `Session::run` 需要 `&mut self`（内部 EP 非
-///   线程安全），用互斥锁串行化推理；批量自对弈通过「合并大 batch」获得并行度。
+/// - 会话池 `Vec<Mutex<Session>>`：onnxruntime 的 `Session::run` 需要 `&mut self`
+///   （内部 EP 非线程安全），每个会话用一把锁串行化；池大小即**并发推理通道数**。
+///   单会话会把所有并发调用挤成一条通道（4x2 批量自对弈实测吞吐只剩一半）。
+/// - `next` 轮转分配会话，使各通道均摊负载；池内会话等价，故无需静态绑定选手。
 /// - 结构为 `Send + Sync`，可跨线程共享（`Arc<OnnxModel>`）。
 pub struct OnnxModel {
-    session: Mutex<Session>,
+    sessions: Vec<Mutex<Session>>,
+    /// 下一个待用会话下标（轮转分配；每会话一把锁，天然均摊到池内各通道）
+    next: AtomicUsize,
     model_path: String,
 }
 
 impl OnnxModel {
-    /// 加载 ONNX 模型。
+    /// 加载 ONNX 模型（单会话）。需要并发推理时用 [`OnnxModel::with_sessions`]。
     ///
     /// `device`: "cpu" 强制 CPU；"cuda" / "auto" 在启用 `onnx-cuda` feature 时
     /// 尝试 CUDA EP（失败自动回退 CPU），否则直接使用 CPU。
     pub fn new(model_path: &str, device: &str) -> Result<Self, String> {
+        Self::with_sessions(model_path, device, 1)
+    }
+
+    /// 加载 ONNX 模型并建立 `sessions` 个独立会话（至少 1 个）。
+    ///
+    /// 会话数即并发推理通道数：批量自对弈应按并发对局数设置，否则推理会被单会话的
+    /// 锁串行化。每个会话的 ORT 内部（intra-op）线程数取 `核数 / sessions`（至少 1），
+    /// 避免多会话各自开满线程导致 CPU 超额订阅。
+    pub fn with_sessions(model_path: &str, device: &str, sessions: usize) -> Result<Self, String> {
+        let count = sessions.max(1);
+        let cores = std::thread::available_parallelism()
+            .map(|v| v.get())
+            .unwrap_or(1);
+        let intra_threads = (cores / count).max(1);
         let prefer_gpu = matches!(device, "cuda" | "auto");
-        let session = build_session(model_path, prefer_gpu)?;
+
+        let mut pool = Vec::with_capacity(count);
+        for _ in 0..count {
+            pool.push(Mutex::new(build_session(
+                model_path,
+                prefer_gpu,
+                intra_threads,
+            )?));
+        }
         Ok(Self {
-            session: Mutex::new(session),
+            sessions: pool,
+            next: AtomicUsize::new(0),
             model_path: model_path.to_string(),
         })
     }
 
     pub fn model_path(&self) -> &str {
         &self.model_path
+    }
+
+    /// 并发推理通道数（会话池大小）。
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
     }
 
     /// 批量前向推理。
@@ -88,9 +121,10 @@ impl OnnxModel {
         ))
         .map_err(|e| format!("构建 scalars 张量失败: {e}"))?;
 
+        // 轮转取一条会话通道：池内会话等价，故任意取一条即可。
+        let session_idx = self.next.fetch_add(1, Ordering::Relaxed) % self.sessions.len();
         // SessionOutputs 借用自 Session，需让互斥锁守卫存活到提取完输出为止。
-        let mut session = self
-            .session
+        let mut session = self.sessions[session_idx]
             .lock()
             .map_err(|e| format!("ONNX 会话锁中毒: {e}"))?;
         let outputs = session
@@ -135,22 +169,34 @@ impl OnnxModel {
 // 会话构建（CUDA EP 为可选项，失败自动回退 CPU）
 // ============================================================================
 
+/// 注：`SessionBuilder::with_*` 的错误类型携带 builder（`Error<SessionBuilder>`），
+/// 无法用 `and_then` 串联，故逐段 `map_err` 后 `?`。
+fn builder_with_intra_threads(intra_threads: usize) -> Result<ort::session::builder::SessionBuilder, String> {
+    let builder = Session::builder().map_err(|e| format!("创建 ONNX 会话构建器失败: {e}"))?;
+    builder
+        .with_intra_threads(intra_threads)
+        .map_err(|e| format!("设置 ONNX intra-op 线程数失败 ({intra_threads}): {e}"))
+}
+
 #[cfg(feature = "onnx-cuda")]
-fn build_cuda_session(model_path: &str) -> Result<Session, String> {
+fn build_cuda_session(model_path: &str, intra_threads: usize) -> Result<Session, String> {
     use ort::execution_providers::CUDAExecutionProvider;
     let provider = CUDAExecutionProvider::default()
         .build()
         .map_err(|e| format!("CUDA EP 构建失败: {e}"))?;
-    Session::builder()
-        .and_then(|mut b| b.with_execution_providers([provider]))
-        .and_then(|mut b| b.commit_from_file(model_path))
+    builder_with_intra_threads(intra_threads)?
+        .with_execution_providers([provider])
+        .map_err(|e| format!("挂载 CUDA EP 失败: {e}"))?
+        .commit_from_file(model_path)
         .map_err(|e| format!("加载 ONNX 模型（CUDA EP）失败 ({model_path}): {e}"))
 }
 
-fn build_session(model_path: &str, prefer_gpu: bool) -> Result<Session, String> {
+/// 只有确定不会并发使用（如调用方 `sessions = 1`）时才应让 intra-op 吃满核心数，
+/// 池化并发时按 `核数 / 会话数` 分配，避免多会话各自开满线程导致超额订阅。
+fn build_session(model_path: &str, prefer_gpu: bool, intra_threads: usize) -> Result<Session, String> {
     #[cfg(feature = "onnx-cuda")]
     if prefer_gpu {
-        match build_cuda_session(model_path) {
+        match build_cuda_session(model_path, intra_threads) {
             Ok(s) => {
                 println!("[onnx] 已使用 CUDA EP: {model_path}");
                 return Ok(s);
@@ -160,8 +206,8 @@ fn build_session(model_path: &str, prefer_gpu: bool) -> Result<Session, String> 
     }
     #[cfg(not(feature = "onnx-cuda"))]
     let _ = prefer_gpu;
-    Session::builder()
-        .and_then(|mut b| b.commit_from_file(model_path))
+    builder_with_intra_threads(intra_threads)?
+        .commit_from_file(model_path)
         .map_err(|e| format!("加载 ONNX 模型失败 ({model_path}): {e}"))
 }
 
