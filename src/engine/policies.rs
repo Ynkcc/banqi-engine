@@ -1,7 +1,41 @@
+//! 引擎策略层：若干简单规则对手
+//!
+//! 提供三类轻量级规则策略，适合作为基线 / 陪练：
+//! - [`RandomPolicy`]：在所有合法动作中均匀随机；
+//! - [`RevealFirstPolicy`]：优先翻棋，其余随机；
+//! - [`CaptureFirstPolicy`]：优先吃明子，其次翻棋，最后随机静走。
+//!
+//! 更重的策略（MCTS + 深度学习）位于同层的 `mcts_dl`（需 `torch` feature）。
+
 use banqi_core::core::env::DarkChessEnv;
 use rand::seq::SliceRandom;
 
-use super::Policy;
+/// 通用策略接口：给定环境，返回一个合法动作（无合法动作时返回 `None`）。
+pub trait Policy {
+    fn choose_action(env: &DarkChessEnv) -> Option<usize>;
+}
+
+/// 随机策略：在所有有效动作中等概率选择。
+pub struct RandomPolicy;
+
+impl Policy for RandomPolicy {
+    fn choose_action(env: &DarkChessEnv) -> Option<usize> {
+        let mut masks = vec![0; env.config.action_space_size];
+        env.action_masks_into(&mut masks);
+        let valid_actions: Vec<usize> = masks
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &val)| if val == 1 { Some(idx) } else { None })
+            .collect();
+
+        if valid_actions.is_empty() {
+            return None;
+        }
+
+        let mut rng = rand::thread_rng();
+        valid_actions.choose(&mut rng).copied()
+    }
+}
 
 /// 当前玩家的合法动作按语义分桶：`(吃明子, 翻棋, 其余)`。
 ///
